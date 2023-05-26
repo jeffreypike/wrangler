@@ -1,5 +1,6 @@
 import jax
 import jax.numpy as jnp
+from math import floor
 
 from models import sigmoid, linear_regression, logistic_regression, get_model_fn
 from losses import mls, mls_grad, mls_hess, bce, bce_grad, bce_hess, get_loss_fn, get_loss_gradient, get_loss_hessian
@@ -86,7 +87,7 @@ def fails_kkt0(grad, penalty, tolerance):
     return jnp.where((grad + penalty) < tolerance, 0, 1)
 
 def fails_kkt1(grad, w, lam, alpha, tolerance):
-    return jnp.where((grad - alpha * lam * w) < tolerance, 0, 1)
+    return jnp.where((grad - (1 - alpha) * lam * w) < tolerance, 0, 1)
 
 
 # S2.1 Local Quadractic Approximation
@@ -109,21 +110,20 @@ def fit_penalized(beta_0,
         model = get_model_fn(loss)
     beta = beta_0.copy()
     loss_fn = get_loss_fn(loss)
+    w = get_penalty_weights(penalty, len(beta))
 
     for _ in range(max_iter):
         # apply local quadratic approximation
         g = get_loss_gradient(loss)(beta, X, y)
         H = get_loss_hessian(loss)(beta, X, y)
-        w = get_penalty_weights(penalty, len(beta))
-
-        Q = H/2 + (1 - alpha) * lam * jnp.diag(w) # for adding ridge regression
-        l = g - H @ beta + alpha * w * get_penalty_grad(penalty)(beta, lam) - alpha * lam * w * jnp.sign(beta)
+        Q = H/2 + alpha * lam * jnp.diag(w) # for adding ridge regression
+        l = g - H @ beta + (1 - alpha) * w * get_penalty_grad(penalty)(beta, lam) - (1 - alpha) * lam * w * jnp.sign(beta)
 
         # solve the local quadratic approximation
-        beta_new = fit_quadratic_lasso(beta, Q, l, w, lam * alpha, max_iter_outer = max_iter_quadratic_outer, max_iter_inner = max_iter_quadratic_inner, tolerance_cd = tolerance_cd, tolerance_kkt = tolerance_kkt)
+        beta_new = fit_quadratic_lasso(beta, Q, l, w, lam * (1 - alpha), max_iter_outer = max_iter_quadratic_outer, max_iter_inner = max_iter_quadratic_inner, tolerance_cd = tolerance_cd, tolerance_kkt = tolerance_kkt)
 
         def penalized_loss(yhat, y, w, lam, alpha):
-            return loss_fn(y, yhat) + alpha * lam * w @ jnp.abs(beta) + (1 - alpha) * lam * w @ jnp.square(beta)
+            return loss_fn(y, yhat) + (1 - alpha) * lam * w @ jnp.abs(beta) + alpha * lam * w @ jnp.square(beta)
 
         # if the solution didn't lower the loss, find one that does with a golden-section search
         if penalized_loss(model(beta_new, X), y, w, lam, alpha) > penalized_loss(model(beta, X), y, w, lam, alpha) + tolerance_loss:
@@ -152,7 +152,7 @@ def fit_penalized(beta_0,
         beta = beta_new
 
         # now check KKT conditions
-        grad = get_loss_gradient(loss)(beta, X, y) + alpha * w * get_penalty_grad(penalty)(beta, lam) + lam * alpha * w * jnp.sign(beta) + 2 * (1 - alpha) * lam * beta
+        grad = get_loss_gradient(loss)(beta, X, y) + (1 - alpha) * w * get_penalty_grad(penalty)(beta, lam) + lam * (1 - alpha) * w * jnp.sign(beta) + 2 * alpha * lam * beta
         kkt0 = fails_kkt0(grad, alpha * lam * w * jnp.sign(beta), tolerance_kkt)
         kkt1 = fails_kkt1(grad, w, lam, alpha, tolerance_kkt)
         kkt = jnp.where(beta != 0, kkt0, kkt1)
@@ -160,3 +160,115 @@ def fit_penalized(beta_0,
             break
     
     return beta
+
+######################################################
+#                                                    #
+#      Section 3: Pathwise Penalized Regression      #
+#                                                    #
+######################################################
+
+# S3.1 Input control
+
+def get_lambda_path(X, y, loss, lambda_count, lambda_minmax_ratio, lambda_weights, alpha):
+    grad = jnp.abs(get_loss_gradient(loss)(jnp.zeros(X.shape[1]), X, y))
+    lambda_max = 1.1 * jnp.max(jnp.where(lambda_weights != 0, grad, 0) / jnp.where(lambda_weights != 0, lambda_weights, 1)) / alpha # why 1.1?
+    lambda_min = lambda_minmax_ratio * lambda_max
+    return jnp.exp(jnp.linspace(jnp.log(lambda_max), jnp.log(lambda_min), lambda_count))
+
+def validate_inputs(X, 
+                  y, 
+                  loss,
+                  penalty,
+                  model,
+                  lambdas,
+                  lambda_count,
+                  lambda_minmax_ratio,
+                  lambda_weights,
+                  alpha):
+
+    supported_penalties = ['lasso', 'ridge']
+    if penalty not in supported_penalties:
+        raise ValueError(f"Only the following penalties are currently supported: {supported_penalties}")
+
+    if model is None:
+        model = get_model_fn(loss)
+
+    if lambda_minmax_ratio is None:
+        lambda_minmax_ratio = 0.01 if X.shape[0] < X.shape[1] else 0.001
+    
+    if lambda_count is None:
+        lambda_count = 100
+    lambda_count = floor(lambda_count)
+    if lambda_count < 10 or lambda_count > 100:
+        raise ValueError("Lambda count must be an integer between 10 and 100")
+
+    if lambda_weights is None:
+        lambda_weights = get_penalty_weights(penalty, X.shape[1])
+    if len(lambda_weights) != X.shape[1]:
+        raise ValueError(f"Number of penalty weights must match number of features.  Expected {X.shape[1]} weights but got {len(lambda_weights)}")
+    
+    if alpha is None:
+        alpha = 1 if penalty == "ridge" else 0
+
+    if lambdas is None:
+        lambdas = get_lambda_path(X, y, loss, lambda_count, lambda_minmax_ratio, lambda_weights, alpha)
+
+    return X, y, loss, penalty, model, lambdas, lambda_count, lambda_minmax_ratio, lambda_weights, alpha
+
+# S3.2 Fitting the path
+def fit_penalized_path(X, 
+                  y, 
+                  loss = "linear", 
+                  penalty = 'lasso',
+                  model = None,
+                  lambdas = None,
+                  lambda_count = None,
+                  lambda_minmax_ratio = None,
+                  lambda_weights = None,
+                  alpha = None,
+                  max_iter = 30,
+                  max_iter_quadratic_outer = 10, 
+                  max_iter_quadratic_inner = 100, 
+                  tolerance_cd = 1e-7, 
+                  tolerance_kkt = 1e-4, 
+                  tolerance_loss = 1e-7):
+
+    # validate inputs and set default values
+    X, y, loss, penalty, model, lambdas, lambda_count, lambda_minmax_ratio, lambda_weights, alpha = validate_inputs(X, y, loss, penalty, model, lambdas, lambda_count, lambda_minmax_ratio, lambda_weights, alpha)
+       
+    output = {}
+
+    # initialize beta as the "solution for large lambda" (all zeros!)
+    beta = jnp.zeros(X.shape[1])
+    w = get_penalty_weights(penalty, X.shape[1])
+
+    for l in range(len(lambdas)):
+        lam = lambdas[l]
+        active_set = jnp.where(beta != 0, True, False)
+
+        for j in range(max_iter):
+            # first check KKT conditions
+            grad = get_loss_gradient(loss)(beta, X, y) + (1 - alpha) * w * get_penalty_grad(penalty)(beta, lam) + lam * (1 - alpha) * w * jnp.sign(beta) + 2 * alpha * lam * beta
+            kkt0 = fails_kkt0(grad, alpha * lam * w * jnp.sign(beta), tolerance_kkt)
+            kkt1 = fails_kkt1(grad, w, lam, alpha, tolerance_kkt)
+            kkt = jnp.where(active_set == True, kkt0, kkt1)
+            if kkt.sum() == 0:
+                break
+
+            # if they are not satisfied, identify the worst offender
+            grad_null = jnp.where(active_set == False, jnp.abs(grad), 0)
+            jmax = jnp.argmax(grad_null)
+            active_set = active_set.at[jmax].set(True)
+
+            # now solve the penalized regression on the updated active set
+            beta_reduced = beta[active_set]
+            X_reduced = X[jnp.repeat(active_set.reshape(1, len(active_set)), repeats = X.shape[0], axis = 0)].reshape(-1, beta_reduced.shape[0])
+            beta_new = fit_penalized(beta_reduced, X_reduced, y, loss, lam, alpha, max_iter, max_iter_quadratic_outer, max_iter_quadratic_inner, tolerance_cd, tolerance_kkt, tolerance_loss, penalty, model)
+            print(beta_new)
+            # update the active parameters
+            beta = beta.at[active_set].set(beta_new)
+
+        # record the result
+        output[lam] = beta
+    
+    return output
