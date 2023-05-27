@@ -50,21 +50,73 @@ def step_quadratic_lasso_cd(beta, Q, l, w, lam, alternate_conditions = None):
         beta_new = beta_new.at[j].set(update)
     return beta_new
 
-# TODO: Currently oesn't work if there are any zeros on the diagonal
+# TODO: Currently doesn't work if there are any zeros on the diagonal
 def fit_quadratic_lasso(beta_0, Q, l, w, lam, max_iter_outer, max_iter_inner, tolerance_cd, tolerance_kkt):
     beta = beta_0.copy()
+    proj_min_outer = 10
+    proj_min_inner = 10
 
-    for _ in range(max_iter_outer):
+    for i in range(max_iter_outer):
         # run coordinate descent on the active set until convergence
-        for _ in range(max_iter_inner):
+        for j in range(max_iter_inner):
             beta_prev = beta.copy()
             beta = step_quadratic_lasso_cd(beta_prev, Q, l, w, lam)
             if has_converged(beta, beta_prev, tolerance_cd):
                 break
+
+            # eliminate coefficients that are very likely to end up being zero
+            beta = jnp.where(beta < 1e-6, 0, beta)
+            
+            # if it's taking too long, try projecting to the active set and solving directly
+            if j == proj_min_inner:
+                direct_solution = jnp.zeros(len(beta))
+
+                active_set = jnp.where(beta != 0, True, False)
+                beta_reduced = beta[active_set]
+                Q_reduced = Q[jnp.repeat(active_set.reshape(1, len(active_set)), repeats = Q.shape[0], axis = 0)].reshape(-1, beta_reduced.shape[0])
+                l_reduced = l[active_set]
+                w_reduced = w[active_set]
+                solution_reduced = -jnp.linalg.inv(Q_reduced) @ (l_reduced + lam * w_reduced * beta_reduced) / 2
+
+                direct_solution = direct_solution.at[active_set].set(solution_reduced)
+                
+                # if the direct solution lowers the loss, run with it
+                def penalized_loss(beta):
+                    beta.T @ Q @ beta + l @ beta + lam * w @ beta
+                
+                if penalized_loss(direct_solution) < penalized_loss(beta):
+                    beta = direct_solution
+
+                proj_min_inner *= 2
         
         # cycle through the (nontrivial) null set once to perturb the stationary solution
         cond = jnp.where((beta == 0) & (w != 0), 1, 0)
         beta = step_quadratic_lasso_cd(beta, Q, l, w, lam, cond)
+
+        # eliminate coefficients that are very likely to end up being zero
+        beta = jnp.where(beta < 1e-6, 0, beta)
+            
+        # if it's taking too long, try projecting to the active set and solving directly
+        if i == proj_min_outer:
+            direct_solution = jnp.zeros(len(beta))
+
+            active_set = jnp.where(beta != 0, True, False)
+            beta_reduced = beta[active_set]
+            Q_reduced = Q[jnp.repeat(active_set.reshape(1, len(active_set)), repeats = Q.shape[0], axis = 0)].reshape(-1, beta_reduced.shape[0])
+            l_reduced = l[active_set]
+            w_reduced = w[active_set]
+            solution_reduced = -jnp.linalg.inv(Q_reduced) @ (l_reduced + lam * w_reduced * beta_reduced) / 2
+
+            direct_solution = direct_solution.at[active_set].set(solution_reduced)
+            
+            # if the direct solution lowers the loss, run with it
+            if penalized_loss(direct_solution) < penalized_loss(beta):
+                beta = direct_solution
+
+            proj_min_outer *= 2
+
+        # eliminate coefficients that are very likely to end up being zero
+        beta = jnp.where(beta < 1e-6, 0, beta)
 
         # now check KKT conditions
         kkt0 = fails_quadratic_kkt0(beta, Q, l, w, lam, tolerance_kkt)
@@ -171,7 +223,7 @@ def fit_penalized(beta_0,
 
 def get_lambda_path(X, y, loss, lambda_count, lambda_minmax_ratio, lambda_weights, alpha):
     grad = jnp.abs(get_loss_gradient(loss)(jnp.zeros(X.shape[1]), X, y))
-    lambda_max = 1.1 * jnp.max(jnp.where(lambda_weights != 0, grad, 0) / jnp.where(lambda_weights != 0, lambda_weights, 1)) / alpha # why 1.1?
+    lambda_max = 1.1 * jnp.max(jnp.where(lambda_weights != 0, grad, 0) / jnp.where(lambda_weights != 0, lambda_weights, 1)) / (1 - alpha) # why 1.1?
     lambda_min = lambda_minmax_ratio * lambda_max
     return jnp.exp(jnp.linspace(jnp.log(lambda_max), jnp.log(lambda_min), lambda_count))
 
@@ -241,10 +293,10 @@ def fit_penalized_path(X,
     # initialize beta as the "solution for large lambda" (all zeros!)
     beta = jnp.zeros(X.shape[1])
     w = get_penalty_weights(penalty, X.shape[1])
+    active_set = jnp.where((beta != 0) | (w == 0), True, False)
 
     for l in range(len(lambdas)):
         lam = lambdas[l]
-        active_set = jnp.where(beta != 0, True, False)
 
         for j in range(max_iter):
             # first check KKT conditions
@@ -264,11 +316,11 @@ def fit_penalized_path(X,
             beta_reduced = beta[active_set]
             X_reduced = X[jnp.repeat(active_set.reshape(1, len(active_set)), repeats = X.shape[0], axis = 0)].reshape(-1, beta_reduced.shape[0])
             beta_new = fit_penalized(beta_reduced, X_reduced, y, loss, lam, alpha, max_iter, max_iter_quadratic_outer, max_iter_quadratic_inner, tolerance_cd, tolerance_kkt, tolerance_loss, penalty, model)
-            print(beta_new)
             # update the active parameters
+            print(beta_new)
             beta = beta.at[active_set].set(beta_new)
 
         # record the result
-        output[lam] = beta
+        output[lam.item()] = beta
     
     return output
