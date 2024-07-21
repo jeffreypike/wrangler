@@ -1,3 +1,3 @@
 # Wrangler
 
-General and efficient model selection using non-convex penalized optimization.
+This project grew out of a frustration at the lack of suitable packages available in Python for solving penalized regression problems (in particular for non-convex penalties).  The idea was to implement the algorithm outlined in [this paper](https://www.sciencedirect.com/science/article/abs/pii/S0167947315002078) directly in Python using JAX as an accelerated Numpy.  At the moment, the poject is in MVP form: the algorithm is working but it currently only supports the lasso penalty (though other penalties would be straightforward to add).  Even when using JAX, the performance of the lasso solver is less impressive than I'd hoped, so I've taken a step back to evaluate other options.  One such option would be to write the program in [Mojo](https://www.modular.com/mojo) instead.
